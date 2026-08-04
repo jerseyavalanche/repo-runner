@@ -144,6 +144,17 @@ def run_image(tag: str, *, cancel: threading.Event) -> tuple[int, str]:
             "--cpus", RUN_CPU_LIMIT,
             "--read-only",
             "--tmpfs", "/tmp",
+            # Real finding, 2026-08-03: an actual container (an s6-overlay
+            # init system) failed immediately because it needs to write to
+            # /run at startup -- read-only root + /tmp alone isn't enough
+            # for some real-world images. tmpfs mounts default to noexec,
+            # which broke this same image a second time (it extracts and
+            # execs an init binary into /run); exec is allowed here since
+            # /run is still just a tmpfs, not a path into the host, so
+            # this doesn't weaken isolation. Some images still won't run
+            # under these constraints -- that's a legitimate finding to
+            # report, not a bug to keep chasing.
+            "--tmpfs", "/run:exec",
             tag,
         ],
         cwd=None,
