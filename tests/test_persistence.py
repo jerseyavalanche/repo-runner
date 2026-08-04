@@ -148,6 +148,108 @@ class JobStoreTests(unittest.TestCase):
             self.store.set_state(job_id, JobState.DISCOVERED)
         self.assertEqual(self.store.get_job(job_id).state, JobState.COMPLETED)
 
+    def test_create_job_stores_metadata_and_source(self) -> None:
+        job = self.store.create_job(
+            "owner/repository",
+            "a" * 40,
+            metadata={"stars": 42, "description": "a thing"},
+            source="github-search:trending",
+        )
+        self.assertEqual(job.metadata, {"stars": 42, "description": "a thing"})
+        self.assertEqual(job.source, "github-search:trending")
+        self.assertIsNone(job.score)
+        reloaded = self.store.get_job(job.id)
+        self.assertEqual(reloaded.metadata, {"stars": 42, "description": "a thing"})
+
+    def test_create_job_without_metadata_or_source_is_none(self) -> None:
+        job = self.store.create_job("owner/repository", "a" * 40)
+        self.assertIsNone(job.metadata)
+        self.assertIsNone(job.source)
+        self.assertIsNone(job.score)
+
+    def test_record_score_sets_score_and_transitions_to_scored(self) -> None:
+        job = self.store.create_job("owner/repository", "a" * 40)
+        self.store.set_state(job.id, JobState.ANALYZED)
+        scored = self.store.record_score(job.id, 87.5)
+        self.assertEqual(scored.state, JobState.SCORED)
+        self.assertEqual(scored.score, 87.5)
+
+    def test_record_score_rejects_out_of_range_values(self) -> None:
+        job = self.store.create_job("owner/repository", "a" * 40)
+        self.store.set_state(job.id, JobState.ANALYZED)
+        with self.assertRaises(ValueError):
+            self.store.record_score(job.id, 150)
+        with self.assertRaises(ValueError):
+            self.store.record_score(job.id, -1)
+
+    def test_record_score_respects_lifecycle_transitions(self) -> None:
+        job = self.store.create_job("owner/repository", "a" * 40)
+        # still "discovered" -- scoring must go through analyzed first.
+        with self.assertRaises(InvalidTransition):
+            self.store.record_score(job.id, 50)
+
+    def test_list_jobs_orders_newest_first_and_filters_by_state(self) -> None:
+        first = self.store.create_job("owner/one", "a" * 40)
+        self.clock.now += timedelta(seconds=1)
+        second = self.store.create_job("owner/two", "b" * 40)
+        self.clock.now += timedelta(seconds=1)
+        self.store.set_state(second.id, JobState.ANALYZED)
+
+        all_jobs = self.store.list_jobs()
+        self.assertEqual([job.id for job in all_jobs], [second.id, first.id])
+
+        discovered_only = self.store.list_jobs(state=JobState.DISCOVERED)
+        self.assertEqual([job.id for job in discovered_only], [first.id])
+
+    def test_list_jobs_respects_limit(self) -> None:
+        for index in range(5):
+            self.store.create_job(f"owner/repo{index}", f"{index}" * 40)
+            self.clock.now += timedelta(seconds=1)
+        limited = self.store.list_jobs(limit=2)
+        self.assertEqual(len(limited), 2)
+
+    def test_schema_migrates_existing_v1_database_in_place(self) -> None:
+        # Simulate a database created before score/metadata/source existed
+        # (SCHEMA_VERSION 1) and confirm opening it with the current
+        # JobStore migrates it in place without losing the existing row.
+        v1_db = Path(self.temp_dir.name) / "v1.sqlite3"
+        with closing(sqlite3.connect(v1_db)) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE jobs (
+                    id INTEGER PRIMARY KEY,
+                    full_name TEXT NOT NULL,
+                    commit_sha TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL,
+                    claimed_at TEXT,
+                    claimed_by TEXT,
+                    heartbeat_at TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (full_name, commit_sha)
+                );
+                INSERT INTO jobs (
+                    full_name, commit_sha, state, max_attempts, created_at, updated_at
+                ) VALUES ('owner/repo', 'a40a40a40a40a40a40a40a40a40a40a40a40a40a',
+                          'discovered', 3, '2026-01-01T00:00:00+00:00',
+                          '2026-01-01T00:00:00+00:00');
+                PRAGMA user_version = 1;
+                """
+            )
+        migrated_store = JobStore(v1_db, clock=self.clock)
+        job = migrated_store.get_job(1)
+        self.assertEqual(job.full_name, "owner/repo")
+        self.assertIsNone(job.score)
+        self.assertIsNone(job.metadata)
+        self.assertIsNone(job.source)
+        # And the new columns are genuinely usable now.
+        migrated_store.set_state(1, JobState.ANALYZED)
+        scored = migrated_store.record_score(1, 42)
+        self.assertEqual(scored.score, 42)
+
 
 if __name__ == "__main__":
     unittest.main()

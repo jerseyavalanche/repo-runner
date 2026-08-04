@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .lifecycle import InvalidTransition, JobState, transition
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class JobNotFound(LookupError):
@@ -37,6 +38,9 @@ class Job:
     last_error: str | None
     created_at: datetime
     updated_at: datetime
+    score: float | None
+    metadata: dict[str, Any] | None
+    source: str | None
 
 
 def _utcnow() -> datetime:
@@ -123,23 +127,53 @@ class JobStore:
                     COMMIT;
                     """
                 )
+                version = 1
+            if version == 1:
+                connection.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    ALTER TABLE jobs ADD COLUMN score REAL
+                        CHECK (score IS NULL OR (score >= 0 AND score <= 100));
+                    ALTER TABLE jobs ADD COLUMN metadata TEXT;
+                    ALTER TABLE jobs ADD COLUMN source TEXT;
+                    PRAGMA user_version = 2;
+                    COMMIT;
+                    """
+                )
 
     def create_job(
-        self, full_name: str, commit_sha: str, *, max_attempts: int = 3
+        self,
+        full_name: str,
+        commit_sha: str,
+        *,
+        max_attempts: int = 3,
+        metadata: dict[str, Any] | None = None,
+        source: str | None = None,
     ) -> Job:
         if not full_name or not commit_sha:
             raise ValueError("full_name and commit_sha are required")
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         now = _timestamp(self._clock())
+        metadata_json = json.dumps(metadata) if metadata is not None else None
         with closing(self._connect()) as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO jobs (
-                    full_name, commit_sha, state, max_attempts, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    full_name, commit_sha, state, max_attempts, created_at,
+                    updated_at, metadata, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (full_name, commit_sha, JobState.DISCOVERED, max_attempts, now, now),
+                (
+                    full_name,
+                    commit_sha,
+                    JobState.DISCOVERED,
+                    max_attempts,
+                    now,
+                    now,
+                    metadata_json,
+                    source,
+                ),
             )
             return self.get_job(cursor.lastrowid, connection=connection)
 
@@ -156,6 +190,53 @@ class JobStore:
         finally:
             if owns_connection:
                 connection.close()
+
+    def list_jobs(
+        self,
+        *,
+        state: JobState | None = None,
+        limit: int = 50,
+    ) -> list[Job]:
+        """Read-only listing, newest first. Safe to call from a separate
+        process/machine concurrently with a running worker -- opens its
+        own short-lived connection, same as every other method here."""
+
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with closing(self._connect()) as connection:
+            if state is None:
+                rows = connection.execute(
+                    "SELECT * FROM jobs ORDER BY updated_at DESC, id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM jobs WHERE state = ?
+                    ORDER BY updated_at DESC, id DESC LIMIT ?
+                    """,
+                    (state, limit),
+                ).fetchall()
+            return [self._to_job(row) for row in rows]
+
+    def record_score(self, job_id: int, score: float) -> Job:
+        """Set a job's score and transition analyzed -> scored in one step
+        -- the score column is the concrete evidence backing the "scored"
+        state, so there's no reason to allow one without the other."""
+
+        if not 0 <= score <= 100:
+            raise ValueError("score must be between 0 and 100")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self.get_job(job_id, connection=connection)
+            transition(current.state, JobState.SCORED)
+            now = _timestamp(self._clock())
+            connection.execute(
+                "UPDATE jobs SET state = ?, score = ?, updated_at = ? WHERE id = ?",
+                (JobState.SCORED, score, now, job_id),
+            )
+            connection.commit()
+            return self.get_job(job_id, connection=connection)
 
     def set_state(self, job_id: int, target: JobState) -> Job:
         """Atomically validate and apply a non-claim lifecycle transition."""
@@ -352,6 +433,9 @@ class JobStore:
             last_error=row["last_error"],
             created_at=_parse_timestamp(row["created_at"]),  # type: ignore[arg-type]
             updated_at=_parse_timestamp(row["updated_at"]),  # type: ignore[arg-type]
+            score=row["score"],
+            metadata=json.loads(row["metadata"]) if row["metadata"] is not None else None,
+            source=row["source"],
         )
 
 
@@ -408,4 +492,3 @@ class StaleClaimRecovery:
 
     def __exit__(self, *_: object) -> None:
         self.stop()
-
