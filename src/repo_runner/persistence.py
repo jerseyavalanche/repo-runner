@@ -238,6 +238,23 @@ class JobStore:
             connection.commit()
             return self.get_job(job_id, connection=connection)
 
+    def update_metadata(self, job_id: int, updates: dict[str, Any]) -> Job:
+        """Merge new keys into a job's existing metadata (e.g. sandbox
+        execution results) without touching its state. Existing keys are
+        preserved unless overwritten by `updates`."""
+
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self.get_job(job_id, connection=connection)
+            merged = {**(current.metadata or {}), **updates}
+            now = _timestamp(self._clock())
+            connection.execute(
+                "UPDATE jobs SET metadata = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(merged), now, job_id),
+            )
+            connection.commit()
+            return self.get_job(job_id, connection=connection)
+
     def set_state(self, job_id: int, target: JobState) -> Job:
         """Atomically validate and apply a non-claim lifecycle transition."""
 
