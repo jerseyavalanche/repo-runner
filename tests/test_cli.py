@@ -1,8 +1,11 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from repo_runner.cli import parse_config
+from repo_runner.cli import main, parse_config
+from repo_runner.lifecycle import JobState
+from repo_runner.persistence import JobStore
 
 
 class CliConfigTests(unittest.TestCase):
@@ -60,6 +63,106 @@ class CliConfigTests(unittest.TestCase):
                 ],
                 environ={},
             )
+
+
+class ScanCommandTests(unittest.TestCase):
+    def test_scan_discovers_and_scores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "jobs.sqlite3"
+            items = [
+                {
+                    "full_name": "owner/good",
+                    "description": "a genuinely useful tool",
+                    "stargazers_count": 50000,
+                }
+            ]
+            with patch(
+                "repo_runner.cli.discover_and_ingest",
+                side_effect=lambda store, query, limit: [
+                    store.create_job(
+                        "owner/good",
+                        "a" * 40,
+                        metadata={
+                            "description": "a genuinely useful tool",
+                            "stars": 50000,
+                            "pushed_at": "",
+                        },
+                        source=f"github-search:{query}",
+                    ).id
+                ],
+            ):
+                exit_code = main(
+                    ["scan", "--database", str(database), "--query", "agents"]
+                )
+            self.assertEqual(exit_code, 0)
+            store = JobStore(database)
+            jobs = store.list_jobs()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0].full_name, "owner/good")
+
+
+class SubmitCommandTests(unittest.TestCase):
+    def test_submit_creates_and_selects_a_job_bypassing_score(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "jobs.sqlite3"
+            with patch(
+                "repo_runner.cli.resolve_head_commit", return_value="b" * 40
+            ):
+                exit_code = main(
+                    ["submit", "--database", str(database), "owner/repo"]
+                )
+            self.assertEqual(exit_code, 0)
+            store = JobStore(database)
+            jobs = store.list_jobs()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0].state, JobState.SELECTED)
+            self.assertEqual(jobs[0].source, "manual")
+
+    def test_submit_custom_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "jobs.sqlite3"
+            with patch(
+                "repo_runner.cli.resolve_head_commit", return_value="c" * 40
+            ):
+                main(
+                    [
+                        "submit",
+                        "--database",
+                        str(database),
+                        "owner/repo",
+                        "--source",
+                        "ruthchat",
+                    ]
+                )
+            store = JobStore(database)
+            self.assertEqual(store.list_jobs()[0].source, "ruthchat")
+
+
+class StatusCommandTests(unittest.TestCase):
+    def test_status_lists_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "jobs.sqlite3"
+            store = JobStore(database)
+            store.create_job("owner/repo", "a" * 40)
+            exit_code = main(["status", "--database", str(database)])
+            self.assertEqual(exit_code, 0)
+
+    def test_status_with_no_jobs_does_not_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "jobs.sqlite3"
+            JobStore(database)
+            exit_code = main(["status", "--database", str(database)])
+            self.assertEqual(exit_code, 0)
+
+    def test_status_filters_by_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "jobs.sqlite3"
+            store = JobStore(database)
+            store.create_job("owner/repo", "a" * 40)
+            exit_code = main(
+                ["status", "--database", str(database), "--state", "selected"]
+            )
+            self.assertEqual(exit_code, 0)
 
 
 if __name__ == "__main__":
