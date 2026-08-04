@@ -1,0 +1,6 @@
+#!/data/data/com.termux/files/usr/bin/sh
+termux-wake-lock
+while true; do
+  proot-distro login ubuntu -- /root/repo-runner/.venv/bin/codex-telegram-bridge --env-file /root/.config/codex-telegram-bridge/.env
+  sleep 5
+done

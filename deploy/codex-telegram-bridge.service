@@ -1,0 +1,16 @@
+[Unit]
+Description=Private Telegram bridge to the local Codex CLI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/repo-runner
+EnvironmentFile=/root/.config/codex-telegram-bridge/.env
+ExecStart=/root/repo-runner/.venv/bin/codex-telegram-bridge
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
