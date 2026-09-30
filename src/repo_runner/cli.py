@@ -15,6 +15,7 @@ from .lifecycle import JobState
 from .orchestrator import OrchestratorService, ServiceConfig, configure_logging
 from .persistence import Job, JobStore
 from .scoring import DEFAULT_SELECTION_THRESHOLD, advance_discovered_jobs
+from .scout import SEARCHES, collect, save_report
 
 ENV_PREFIX = "REPO_RUNNER_"
 DEFAULT_DATABASE = "repo-runner.sqlite3"
@@ -35,6 +36,11 @@ def build_parser(environ: dict[str, str] | None = None) -> argparse.ArgumentPars
     env = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(prog="repo-runner")
     commands = parser.add_subparsers(dest="command", required=True)
+
+    scout = commands.add_parser("scout", help="research public Android and off-grid projects on a phone")
+    scout.add_argument("--category", choices=list(SEARCHES) + ["all"], default="all")
+    scout.add_argument("--limit", type=int, default=10, help="results per search (1-30)")
+    scout.add_argument("--output", type=Path, default=Path("reports"))
 
     run = commands.add_parser("run", help="run one continuous worker")
     run.add_argument(
@@ -175,6 +181,16 @@ def _status(options: argparse.Namespace) -> int:
 def main(arguments: Sequence[str] | None = None) -> int:
     parser = build_parser()
     options = parser.parse_args(arguments)
+    if options.command == "scout":
+        if not 1 <= options.limit <= 30:
+            parser.error("--limit must be between 1 and 30")
+        categories = list(SEARCHES) if options.category == "all" else [options.category]
+        rows, errors = collect(categories, limit=options.limit)
+        json_path, md_path = save_report(options.output, rows, errors)
+        print(f"Found {len(rows)} repositories; report: {md_path}; data: {json_path}")
+        for error in errors:
+            print(f"Search error: {error}")
+        return 1 if errors else 0
     if options.command == "run":
         try:
             return _run(options)
